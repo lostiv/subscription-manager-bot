@@ -41,8 +41,8 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            tslcat/subscription-manager-bot:latest
-            tslcat/subscription-manager-bot:${{ github.ref_name }}
+            lost4/subscription-manager-bot:latest
+            lost4/subscription-manager-bot:${{ github.ref_name }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -52,5 +52,5 @@ jobs:
         run: |
           echo "✅ Docker 镜像构建并推送成功！"
           echo "📦 镜像地址："
-          echo "   docker pull tslcat/subscription-manager-bot:latest"
-          echo "   docker pull tslcat/subscription-manager-bot:${{ github.ref_name }}"
+          echo "   docker pull lost4/subscription-manager-bot:latest"
+          echo "   docker pull lost4/subscription-manager-bot:${{ github.ref_name }}"
