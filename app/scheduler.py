@@ -2,7 +2,7 @@ import time
 import re
 from datetime import datetime
 from .db import load_targets, get_push_time
-from .telegram import send_daily_report   # 定时推送使用
+from .telegram import check_and_send_node_reminders, send_daily_report   # feat: 定时推送接入节点提醒
 from .config import TIMEZONE
 
 # 使用 (日期, 小时, 分钟) 作为 key，支持当天多次修改未来时间后继续推送
@@ -39,6 +39,9 @@ def push_loop(stop_event=None):
 
             # fix #5: 到达目标时刻后当天只成功推送一次，不受错过分钟窗口影响
             if now >= scheduled_at and current_key != last_pushed_key:
+                # feat: 每日报告前先发送多节点到期提醒，失败不阻塞日报
+                if not check_and_send_node_reminders():
+                    print("scheduler warning: node reminders failed, continuing daily report")
                 # fix #7: 仅发送成功后记录，发送失败时下轮继续重试
                 if send_daily_report():
                     last_pushed_key = current_key

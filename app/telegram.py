@@ -3,6 +3,8 @@ import time
 import json
 import html
 import re
+# feat: 使用标准库编码续费回调中的目标名称
+from urllib.parse import quote, unquote
 from datetime import datetime
 from .db import (
     load_targets,
@@ -16,8 +18,13 @@ from .db import (
     get_push_time,
     get_language,
     set_language,
+    has_reminded,
+    mark_reminded,
+    renew_target,
 )
 from .config import BOT_TOKEN, TG_USER_ID, BASE_URL, TIMEZONE
+# feat: 接入统一的提醒节点判定
+from .utils import reminder_node_for
 
 last_offset = 0
 
@@ -75,6 +82,17 @@ TRANSLATIONS = {
     "edit_format_error": {"en": "❌ Format error\nEnter a new name and date (YYYY-MM-DD), or just a date", "zh": "❌ 格式错误\n请输入新名称和日期（YYYY-MM-DD），或只输入日期"},
     "language_usage": {"en": "Usage: /language zh|en", "zh": "用法：/language zh|en"},
     "language_set": {"en": "✅ Daily report language set to English", "zh": "✅ 日报语言已设置为中文"},
+    # feat: 增加多节点提醒和续费交互的中英文文案
+    "reminder_due": {"en": "🔔 <b>{name}</b> expires in {days} days ({date})", "zh": "🔔 <b>{name}</b> 还有 {days} 天到期（{date}）"},
+    "reminder_overdue": {"en": "⚠️ <b>{name}</b> overdue by {days} days (original expiry {date})", "zh": "⚠️ <b>{name}</b> 已逾期 {days} 天（原到期 {date}）"},
+    "renew_button": {"en": "✅ Renewed", "zh": "✅ 已续费"},
+    "renew_period_prompt": {"en": "⏳ {name} renewal extension, choose a period:", "zh": "⏳ {name} 续费顺延，选择周期："},
+    "renew_opt_1m": {"en": "+1 month", "zh": "+1 个月"},
+    "renew_opt_3m": {"en": "+1 quarter", "zh": "+1 季度"},
+    "renew_opt_12m": {"en": "+1 year", "zh": "+1 年"},
+    "renew_success": {"en": "✅ {name} extended to {date}", "zh": "✅ {name} 已顺延至 {date}"},
+    "renew_failed": {"en": "❌ Renewal failed (target does not exist or has been archived)", "zh": "❌ 续费失败（目标不存在或已被归档）"},
+    "renew_usage": {"en": "Usage: /renew <name> (or use the reminder button)", "zh": "用法 /renew <名称>（或从提醒按钮进入）"},
 }
 
 def send_msg(text, reply_markup=None):
@@ -263,6 +281,63 @@ def send_daily_report():
     return send_msg(f"📅 <b>{get_text('daily_report_title', lang)}</b>\n\n{body}", generate_inline_buttons(lang))
 
 
+# feat: 为目标生成续费周期选择按钮并过滤超长回调数据
+def _renew_period_keyboard(name, lang):
+    buttons = []
+    option_keys = ((1, "renew_opt_1m"), (3, "renew_opt_3m"), (12, "renew_opt_12m"))
+    encoded_name = quote(name, safe="")
+    for months, text_key in option_keys:
+        callback_data = f"renew_opt:{encoded_name}:{months}"
+        if len(callback_data.encode()) <= 58:
+            buttons.append({"text": get_text(text_key, lang), "callback_data": callback_data})
+    return {"inline_keyboard": [buttons]} if buttons else None
+
+
+# feat: 发送续费周期选择消息
+def _send_renew_period_prompt(name, lang):
+    keyboard = _renew_period_keyboard(name, lang)
+    prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
+    if keyboard is None:
+        prompt += "\n\n" + get_text("renew_usage", lang)
+    return send_msg(prompt, keyboard)
+
+
+# feat: 检查并发送每个目标命中的到期提醒节点
+def check_and_send_node_reminders() -> bool:
+    try:
+        targets = load_targets()
+        today = datetime.now(TIMEZONE).date()
+        lang = get_language()
+        for name, target_date in targets.items():
+            days = (target_date.date() - today).days
+            node = reminder_node_for(days)
+            if node is None or has_reminded(name, node):
+                continue
+            escaped_name = html.escape(name)
+            date_str = target_date.strftime("%Y-%m-%d")
+            if days >= 0:
+                message = get_text("reminder_due", lang, name=escaped_name, days=days, date=date_str)
+            else:
+                message = get_text("reminder_overdue", lang, name=escaped_name, days=-days, date=date_str)
+            encoded_name = quote(name, safe="")
+            callback_data = f"renew:{encoded_name}"
+            keyboard = None
+            if len(callback_data.encode()) <= 58:
+                keyboard = {
+                    "inline_keyboard": [[
+                        {"text": get_text("renew_button", lang), "callback_data": callback_data}
+                    ]]
+                }
+            else:
+                message += "\n\n" + get_text("renew_usage", lang)
+            if send_msg(message, keyboard):
+                mark_reminded(name, node)
+        return True
+    except Exception as error:
+        print(f"reminder warning: {type(error).__name__}")
+        return False
+
+
 def is_valid_date(date_str: str) -> bool:
     """检查日期字符串是否为有效 YYYY-MM-DD 格式"""
     if not date_str or not isinstance(date_str, str):
@@ -323,6 +398,27 @@ def handle_callback_query(update):
     elif callback_data == "import_data":
         user_state["pending_import"] = True
         send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
+    # feat: 处理提醒消息进入续费周期选择
+    elif callback_data.startswith("renew:"):
+        name = unquote(callback_data[len("renew:"):])
+        if name not in load_targets():
+            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+        else:
+            _send_renew_period_prompt(name, lang)
+    # feat: 处理续费周期回调并刷新目标列表
+    elif callback_data.startswith("renew_opt:"):
+        encoded_name, separator, months_str = callback_data[len("renew_opt:"):].rpartition(":")
+        name = unquote(encoded_name) if separator else ""
+        try:
+            months = int(months_str) if separator else None
+        except ValueError:
+            months = None
+        new_date = renew_target(name, months)
+        if new_date:
+            send_msg(get_text("renew_success", lang, name=html.escape(name), date=new_date), generate_inline_buttons(lang))
+            show_targets(update)
+        else:
+            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
 
 def handle_message(update):
     global user_state
@@ -338,6 +434,17 @@ def handle_message(update):
 
     if command == "/start":
         send_msg(get_text("start_welcome", lang), generate_inline_buttons(lang))
+        return
+
+    # feat: 支持通过 /renew 和完整名称发起续费顺延
+    if command == "/renew":
+        name = args.strip()
+        if not name:
+            send_msg(get_text("renew_usage", lang), generate_inline_buttons(lang))
+        elif name not in load_targets():
+            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+        else:
+            _send_renew_period_prompt(name, lang)
         return
 
     if command == "/language":
