@@ -1,5 +1,7 @@
 import sqlite3
 import json
+# feat: 使用标准库日历计算顺延后的月末日期
+import calendar
 from datetime import datetime
 import re
 from .config import DB_PATH, TIMEZONE
@@ -36,6 +38,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            )
+        ''')
+        # feat: 初始化多节点提醒去重表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reminder_log (
+                name TEXT NOT NULL,
+                node TEXT NOT NULL,
+                reminded_at TEXT NOT NULL,
+                PRIMARY KEY (name, node)
             )
         ''')
         # fix #21: 为日报语言建立持久化默认值
@@ -314,6 +325,108 @@ def get_language():
     try:
         row = conn.execute("SELECT value FROM settings WHERE key = 'language'").fetchone()
         return row["value"] if row and row["value"] in {"zh", "en"} else "zh"
+    finally:
+        conn.close()
+
+
+# feat: 记录目标节点提醒并按主键去重
+def mark_reminded(name, node):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO reminder_log (name, node, reminded_at) VALUES (?, ?, ?)",
+            (name, node, datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+# feat: 查询目标节点是否已经提醒
+def has_reminded(name, node):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM reminder_log WHERE name = ? AND node = ?",
+            (name, node),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+# feat: 续费顺延后清理目标的全部提醒节点
+def clear_reminders(name):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM reminder_log WHERE name = ?", (name,))
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+# feat: 按月顺延日期并对月末日期进行截断
+def add_months(date_str: str, months: int):
+    """YYYY-MM-DD 加 months 个月，月末截断；非法输入返回 None。"""
+    if isinstance(months, bool) or not isinstance(months, int):
+        return None
+    try:
+        source_date = datetime.strptime(date_str, "%Y-%m-%d")
+        month_index = source_date.year * 12 + source_date.month - 1 + months
+        year, month_index = divmod(month_index, 12)
+        month = month_index + 1
+        day = min(source_date.day, calendar.monthrange(year, month)[1])
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+# feat: 在单事务内完成续费顺延并清除旧提醒记录
+def renew_target(name: str, months: int):
+    """从原日期和今天中较晚者顺延，成功返回新日期字符串。"""
+    # feat: 严格限制续费周期为整数月数选项
+    if isinstance(months, bool) or not isinstance(months, int) or months not in {1, 3, 12}:
+        return None
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT target_date FROM targets WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        try:
+            original_date = datetime.strptime(row["target_date"], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            conn.rollback()
+            return None
+        base_date = max(original_date, datetime.now(TIMEZONE).date())
+        new_date = add_months(base_date.strftime("%Y-%m-%d"), months)
+        if not new_date:
+            conn.rollback()
+            return None
+        cursor = conn.execute(
+            "UPDATE targets SET target_date = ? WHERE name = ?",
+            (new_date, name),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
+        conn.execute("DELETE FROM reminder_log WHERE name = ?", (name,))
+        conn.commit()
+        return new_date
+    except sqlite3.Error:
+        conn.rollback()
+        return None
     finally:
         conn.close()
 

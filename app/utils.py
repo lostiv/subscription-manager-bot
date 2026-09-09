@@ -2,6 +2,20 @@ from datetime import datetime
 from .config import TIMEZONE
 
 
+# feat: 定义到期前和当天的提醒档位
+REMINDER_NODES = (30, 7, 3, 1, 0)
+
+
+# feat: 根据剩余自然日计算提醒节点
+def reminder_node_for(days: int):
+    """命中 30/7/3/1/0 返回节点字符串，逾期返回 overdue。"""
+    if days in REMINDER_NODES:
+        return str(days)
+    if days < 0:
+        return "overdue"
+    return None
+
+
 def format_msg(targets: dict) -> str:
     """定时推送使用的简洁消息"""
     if not targets:
