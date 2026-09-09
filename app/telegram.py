@@ -53,9 +53,11 @@ TRANSLATIONS = {
     "export_button": {"en": "📤 Export All", "zh": "📤 导出全部"},
     "import_button": {"en": "📥 Import All", "zh": "📥 导入全部"},
     "set_time_button": {"en": "⏰ Set Daily Push Time", "zh": "⏰ 设置每日推送时间"},
+    "renew_action_button": {"en": "🔄 Renewed (action)", "zh": "🔄 已续费"},
 
     "edit_prompt": {"en": "✏️ Please enter the <b>number</b> of the target to edit (e.g. 1 or 2...)", "zh": "✏️ 请输入要<b>修改</b>的目标序号（例如：1或2...）"},
     "archive_prompt": {"en": "📦 Please enter the <b>number</b> of the target to archive (enter <b>0</b> to view all archived; enter <b>1 or 2...</b> to archive)", "zh": "📦 请输入要<b>归档</b>的目标序号（输入 <b>0</b> 查看所有历史归档;输入<b>1或2...</b> 归档目标）"},
+    "renew_select_prompt": {"en": "Pick target to renew (send its number):", "zh": "选择要续费的目标（发送编号）："},
     "add_target_prompt": {"en": "➕ Please enter: /addsub &lt;name&gt; &lt;date&gt;\nExample: /addsub XChat Registration 2026-04-25", "zh": "➕ 请输入：/addsub &lt;名称&gt; &lt;日期&gt;\n示例：/addsub XChat注册 2026-04-25"},
     "set_time_prompt": {"en": "Please enter the new push time in HH:MM format", "zh": "请输入新的推送时间，格式：HH:MM"},
     "export_success": {"en": "📤 <b>Full backup generated</b>\n\n<code>{json_str}</code>", "zh": "📤 <b>完整备份已生成</b>\n\n<code>{json_str}</code>"},
@@ -204,6 +206,7 @@ def generate_inline_buttons(lang="en"):
             [
                 {"text": get_text("edit_button", lang), "callback_data": "action_edit"},
                 {"text": get_text("archive_button", lang), "callback_data": "action_archive"},
+                {"text": get_text("renew_action_button", lang), "callback_data": "action_renew"},
             ],
             [
                 {"text": get_text("refresh_button", lang), "callback_data": "show_subscriptions"},
@@ -385,6 +388,9 @@ def handle_callback_query(update):
     elif callback_data == "action_archive":
         user_state["pending_action"] = "archive"
         send_msg(get_text("archive_prompt", lang), generate_inline_buttons(lang))
+    elif callback_data == "action_renew":
+        user_state["pending_action"] = "renew"
+        send_msg(get_text("renew_select_prompt", lang), generate_inline_buttons(lang))
     elif callback_data == "show_subscriptions":
         show_targets(update)
     elif callback_data == "add_target":
@@ -480,7 +486,18 @@ def handle_message(update):
             if user_state["pending_action"] == "edit":
                 user_state["pending_edit_target"] = old_name
                 user_state["pending_action"] = None
-                send_msg(get_text("edit_current", lang, name=html.escape(old_name), date=current_date), generate_inline_buttons(lang))
+                callback_data = f"renew:{quote(old_name, safe='')}"
+                keyboard = None
+                if len(callback_data.encode()) <= 58:
+                    keyboard = {
+                        "inline_keyboard": [[
+                            {"text": get_text("renew_button", lang), "callback_data": callback_data}
+                        ]]
+                    }
+                send_msg(
+                    get_text("edit_current", lang, name=html.escape(old_name), date=current_date),
+                    keyboard,
+                )
                 return
             elif user_state["pending_action"] == "archive":
                 if archive_target(old_name):
@@ -488,6 +505,10 @@ def handle_message(update):
                     show_targets(update)
                 else:
                     send_msg(get_text("archive_failed", lang), generate_inline_buttons(lang))
+                user_state["pending_action"] = None
+                return
+            elif user_state["pending_action"] == "renew":
+                _send_renew_period_prompt(old_name, lang)
                 user_state["pending_action"] = None
                 return
 
