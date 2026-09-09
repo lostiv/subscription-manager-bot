@@ -9,9 +9,9 @@ from .config import TIMEZONE
 last_pushed_key = None
 invalid_time_logged = False
 
-def push_loop():
+def push_loop(stop_event=None):
     global last_pushed_key, invalid_time_logged
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             # fix #6: 调度使用 Asia/Shanghai 的带时区当前时间
             now = datetime.now(TIMEZONE)
@@ -27,7 +27,10 @@ def push_loop():
                 if not invalid_time_logged:
                     print("scheduler warning: invalid push time, skipping this cycle")
                     invalid_time_logged = True
-                time.sleep(15)
+                if stop_event is None:
+                    time.sleep(15)
+                else:
+                    stop_event.wait(15)
                 continue
             today = now.date()
 
@@ -45,4 +48,8 @@ def push_loop():
         except Exception as e:
             print(f"scheduler error: {e}")
 
-        time.sleep(15)
+        # fix #22: 停止事件可打断调度等待，线程能及时退出
+        if stop_event is None:
+            time.sleep(15)
+        else:
+            stop_event.wait(15)

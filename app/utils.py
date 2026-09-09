@@ -1,4 +1,5 @@
 from datetime import datetime
+from .config import TIMEZONE
 
 
 def format_msg(targets: dict) -> str:
@@ -10,7 +11,9 @@ def format_msg(targets: dict) -> str:
     sorted_targets = sorted(targets.items(), key=lambda x: x[1])
 
     for name, target_date in sorted_targets:
-        days_left = (target_date - datetime.now()).days
+        # fix #15: 倒计时按本地自然日计算，避免当天午夜后的负数误判
+        days_left = target_date.date() - datetime.now(TIMEZONE).date()
+        days_left = days_left.days
         if days_left < 0:
             message += f"{name}: 已结束\n"
         elif days_left == 0:
@@ -31,7 +34,9 @@ def get_formatted_targets(targets: dict) -> str:
     sorted_targets = sorted(targets.items(), key=lambda x: x[1])
 
     for name, target_date in sorted_targets:
-        days_left = (target_date - datetime.now()).days
+        # fix #15: 手动查看与日报统一使用本地自然日口径
+        days_left = target_date.date() - datetime.now(TIMEZONE).date()
+        days_left = days_left.days
         if days_left < 0:
             message += f"<i>{name}: 已结束</i>\n"
         elif days_left == 0:

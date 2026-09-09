@@ -14,6 +14,8 @@ from .db import (
     normalize_date,
     validate_import_data,
     get_push_time,
+    get_language,
+    set_language,
 )
 from .config import BOT_TOKEN, TG_USER_ID, BASE_URL, TIMEZONE
 
@@ -65,11 +67,14 @@ TRANSLATIONS = {
     "archived_history": {"en": "📦 <b>Archived History</b>\n\n", "zh": "📦 <b>历史已归档目标</b>\n\n"},
     "add_success": {"en": "✅ Added successfully!", "zh": "✅ 添加成功！"},
     "add_failed": {"en": "❌ Add failed, please check date format (YYYY-MM-DD)", "zh": "❌ 添加失败，请检查日期格式（YYYY-MM-DD）"},
-    "format_error": {"en": "❌ Format error\nCorrect example: /addsub XChat Registration 2026-04-25", "zh": "❌ 格式错误\n正确示例：/addsub XChat注册 2026-04-25"},
+    "format_error": {"en": "❌ Format error\nCorrect example: /addsub XChat Registration 2026-04-25", "zh": "❌ 格式错误\n正确示例：/addsub XChat Registration 2026-04-25"},
     "push_time_set": {"en": "✅ Push time has been set to <b>{time}</b>", "zh": "✅ 推送时间已设置为 <b>{time}</b>"},
     "import_success": {"en": "✅ Successfully imported {count} targets!", "zh": "✅ 成功导入 {count} 个目标！"},
     "json_error": {"en": "❌ JSON format error: {error}", "zh": "❌ JSON 格式错误：{error}"},
     "daily_report_title": {"en": "Daily Report", "zh": "每日报告"},
+    "edit_format_error": {"en": "❌ Format error\nEnter a new name and date (YYYY-MM-DD), or just a date", "zh": "❌ 格式错误\n请输入新名称和日期（YYYY-MM-DD），或只输入日期"},
+    "language_usage": {"en": "Usage: /language zh|en", "zh": "用法：/language zh|en"},
+    "language_set": {"en": "✅ Daily report language set to English", "zh": "✅ 日报语言已设置为中文"},
 }
 
 def send_msg(text, reply_markup=None):
@@ -154,6 +159,27 @@ def get_text(key, lang="en", **kwargs):
         text = text.format(**kwargs)
     return text
 
+
+def _parse_command(text):
+    # fix #17: 只按完整命令 token 分派，并兼容 /command@botname
+    parts = text.split(maxsplit=1)
+    if not parts or not parts[0].startswith("/"):
+        return None, ""
+    command = parts[0].split("@", 1)[0].lower()
+    return command, parts[1] if len(parts) == 2 else ""
+
+
+def _parse_name_date(text):
+    # fix #16: 从输入末尾识别日期，名称保留前面的全部内容
+    match = re.fullmatch(r"(.+?)\s+(\d{4}-\d{2}-\d{2})", text.strip())
+    if not match:
+        return None
+    name = match.group(1).strip()
+    date_str = normalize_date(match.group(2))
+    if not name or not date_str:
+        return None
+    return name, date_str
+
 def generate_inline_buttons(lang="en"):
     keyboard = {
         "inline_keyboard": [
@@ -229,7 +255,8 @@ def format_numbered_targets(targets, lang="en"):
 
 def send_daily_report():
     targets = load_targets()
-    lang = "zh"   # 你可以改成 "en" 作为默认
+    # fix #21: 定时日报使用持久化语言，手动消息仍由 Telegram 语言决定
+    lang = get_language()
     if not targets:
         return send_msg(get_text("daily_report_title", lang) + "\n\n" + get_text("no_targets", lang), generate_inline_buttons(lang))
     body = format_numbered_targets(targets, lang).replace(f"                  <b>{get_text('current_targets_title', lang)}</b>\n\n", "")
@@ -307,9 +334,18 @@ def handle_message(update):
         return
     lang = get_user_lang(update)
     text = update["message"]["text"].strip()
+    command, args = _parse_command(text)
 
-    if text == "/start":
+    if command == "/start":
         send_msg(get_text("start_welcome", lang), generate_inline_buttons(lang))
+        return
+
+    if command == "/language":
+        requested_lang = args.strip().lower()
+        if requested_lang not in {"zh", "en"} or not set_language(requested_lang):
+            send_msg(get_text("language_usage", lang), generate_inline_buttons(lang))
+        else:
+            send_msg(get_text("language_set", requested_lang), generate_inline_buttons(requested_lang))
         return
 
     if user_state["pending_action"] and text.isdigit():
@@ -350,24 +386,29 @@ def handle_message(update):
 
     if user_state["pending_edit_target"] and text:
         old_name = user_state["pending_edit_target"]
-        parts = text.strip().split(maxsplit=1)
         new_name = None
         new_date = None
-        if len(parts) == 1:
-            if is_valid_date(parts[0]):
-                new_date = parts[0]
-            else:
-                new_name = parts[0]
+        parsed = _parse_name_date(text)
+        if parsed:
+            new_name, new_date = parsed
+        elif is_valid_date(text):
+            new_date = normalize_date(text)
+        elif len(text.split()) == 1 and not re.search(r"\d", text):
+            # fix #16: 保留既有单 token 只改名称语义，多词输入必须带日期
+            new_name = text.strip()
         else:
-            new_name = parts[0]
-            if len(parts) > 1 and is_valid_date(parts[1]):
-                new_date = parts[1]
-        if update_target(old_name, new_name, new_date):
+            # fix #16: 编辑解析失败时保留状态，不静默修改目标
+            send_msg(get_text("edit_format_error", lang), generate_inline_buttons(lang))
+            return
+        updated = update_target(old_name, new_name, new_date)
+        if updated:
             send_msg(get_text("edit_success", lang), generate_inline_buttons(lang))
-            show_targets(update)
         else:
             send_msg(get_text("edit_failed", lang), generate_inline_buttons(lang))
         user_state["pending_edit_target"] = None
+        if updated:
+            # fix #20: 编辑操作完成后由编辑流程主动清理状态
+            show_targets(update)
         return
 
     if user_state["pending_import"]:
@@ -396,10 +437,10 @@ def handle_message(update):
         user_state["pending_import"] = False
         return
 
-    if text.startswith("/addsub"):
-        parts = text.split(maxsplit=2)
-        if len(parts) == 3:
-            _, name, date_str = parts
+    if command == "/addsub":
+        parsed = _parse_name_date(args)
+        if parsed:
+            name, date_str = parsed
             from .db import add_target
             if add_target(name, date_str):
                 send_msg(get_text("add_success", lang), generate_inline_buttons(lang))
@@ -410,12 +451,12 @@ def handle_message(update):
             send_msg(get_text("format_error", lang), generate_inline_buttons(lang))
         return
 
-    elif text.startswith("/export"):
+    elif command == "/export":
         data = export_all()
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         send_export(json_str, lang)
 
-    elif text.startswith("/import"):
+    elif command == "/import":
         user_state["pending_import"] = True
         send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
 
@@ -427,13 +468,12 @@ def handle_message(update):
             send_msg(get_text("push_time_failed", lang), generate_inline_buttons(lang))
         return
 
-    elif text.startswith("/subs") or text.lower() == "/list all":
+    elif command == "/subs" or (command == "/list" and args.strip().lower() == "all"):
         show_targets(update)
 
 def show_targets(update):
-    global user_state
     lang = get_user_lang(update)
-    user_state = {k: None if k != "pending_import" else False for k in user_state}
+    # fix #20: 展示列表不清理尚未完成的交互状态
     targets = load_targets()
     formatted = format_numbered_targets(targets, lang)
     keyboard = generate_inline_buttons(lang)

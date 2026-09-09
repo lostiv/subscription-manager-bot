@@ -4,33 +4,48 @@ from datetime import datetime
 import re
 from .config import DB_PATH, TIMEZONE
 
+
+def _connect():
+    # fix #19: 所有线程独立连接，并统一设置忙等待和 Row 工厂
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
 # =========================
 # 初始化数据库
 # =========================
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS targets (
-            name TEXT PRIMARY KEY,
-            target_date TEXT NOT NULL
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS targets (
+                name TEXT PRIMARY KEY,
+                target_date TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS archives (
+                name TEXT PRIMARY KEY,
+                target_date TEXT NOT NULL,
+                archived_date TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+        # fix #21: 为日报语言建立持久化默认值
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            ("language", "zh"),
         )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS archives (
-            name TEXT PRIMARY KEY,
-            target_date TEXT NOT NULL,
-            archived_date TEXT NOT NULL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 # =========================
 # 添加或更新当前目标
@@ -40,7 +55,7 @@ def add_target(name, date_str):
     if not _valid_name(name) or not date_str:
         return False
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cursor = conn.cursor()
     try:
         cursor.execute(
@@ -62,7 +77,7 @@ def update_target(old_name: str, new_name: str = None, new_date: str = None):
     """修改名称和/或日期。如果只改其中一项，另一项保持不变"""
     if new_name is None:
         new_name = old_name
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cursor = conn.cursor()
     try:
         # fix: 同一事务内读取、检查冲突并更新，避免跨连接 TOCTOU
@@ -106,26 +121,29 @@ def update_target(old_name: str, new_name: str = None, new_date: str = None):
 # 获取所有当前目标
 # =========================
 def load_targets():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, target_date FROM targets")
-    rows = cursor.fetchall()
-    conn.close()
-
     targets = {}
-    for name, date_str in rows:
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-            targets[name] = target_date
-        except:
-            pass
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, target_date FROM targets")
+        rows = cursor.fetchall()
+        for row in rows:
+            name, date_str = row["name"], row["target_date"]
+            try:
+                target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                targets[name] = target_date
+            except (TypeError, ValueError) as error:
+                # fix #18: 坏日期需可观察，避免读取时静默丢失
+                print(f"db warning: skipped target {name!r} with invalid date ({error})")
+    finally:
+        conn.close()
     return targets
 
 # =========================
 # 归档目标
 # =========================
 def archive_target(name):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT target_date FROM targets WHERE name = ?", (name,))
@@ -154,19 +172,22 @@ def archive_target(name):
 # 获取所有已归档目标
 # =========================
 def load_archives():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, target_date FROM archives ORDER BY archived_date DESC")
-    rows = cursor.fetchall()
-    conn.close()
-
     archives = {}
-    for name, date_str in rows:
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
-            archives[name] = target_date
-        except:
-            pass
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, target_date FROM archives ORDER BY archived_date DESC")
+        rows = cursor.fetchall()
+        for row in rows:
+            name, date_str = row["name"], row["target_date"]
+            try:
+                target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+                archives[name] = target_date
+            except (TypeError, ValueError) as error:
+                # fix #18: 坏归档日期需记录名称和原因后再跳过
+                print(f"db warning: skipped archive {name!r} with invalid date ({error})")
+    finally:
+        conn.close()
     return archives
 
 # =========================
@@ -207,7 +228,7 @@ def import_all(data: dict):
             return result
         normalized.append((kind, name, date_str))
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cursor = conn.cursor()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -248,23 +269,53 @@ def set_push_time(time_str):
         normalized_time = datetime.strptime(candidate, "%H:%M").strftime("%H:%M")
     except (TypeError, ValueError):
         return False
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        ("push_time", normalized_time)
-    )
-    conn.commit()
-    conn.close()
-    return True
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("push_time", normalized_time)
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 def get_push_time():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = 'push_time'")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else "09:00"
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'push_time'")
+        row = cursor.fetchone()
+        return row["value"] if row else "09:00"
+    finally:
+        conn.close()
+
+
+def set_language(language):
+    # fix #21: 仅持久化支持的日报语言
+    if language not in {"zh", "en"}:
+        return False
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("language", language),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_language():
+    # fix #21: 定时日报读取数据库中的语言设置
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'language'").fetchone()
+        return row["value"] if row and row["value"] in {"zh", "en"} else "zh"
+    finally:
+        conn.close()
 
 
 def _valid_name(name):
