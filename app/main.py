@@ -27,9 +27,23 @@ def start_telegram_polling():
     print("✅ Telegram 消息轮询已启动")
 
 def poll_loop():
+    retry_delay = 1
     while True:
-        poll_updates()
-        time.sleep(1)
+        result = poll_updates()
+        if result is True:
+            retry_delay = 1
+            time.sleep(0.2)
+        elif result == "auth":
+            time.sleep(60)
+        elif result == "conflict":
+            time.sleep(10)
+        elif result == "rate_limit":
+            time.sleep(min(retry_delay * 2, 60))
+            retry_delay = min(retry_delay * 2, 60)
+        else:
+            # fix #4: 长轮询断线按指数退避重连，main.py 是唯一 polling 入口
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
 
 if __name__ == "__main__":
     initialize()
