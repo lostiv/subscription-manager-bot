@@ -57,12 +57,11 @@ def poll_loop(stop_event=None):
                 stop_event.wait(delay)
             retry_delay = min(retry_delay * 2, 60)
         else:
-            # fix #4: 长轮询断线按指数退避重连，main.py 是唯一 polling 入口
+            # fix: 长轮询断连是宿主网络常态，固定等待 2 秒后快速重连
             if stop_event is None:
-                time.sleep(retry_delay)
+                time.sleep(2)
             else:
-                stop_event.wait(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)
+                stop_event.wait(2)
 
 if __name__ == "__main__":
     initialize()

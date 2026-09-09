@@ -599,9 +599,10 @@ def _json_depth_ok(value, depth=0):
 def poll_updates():
     global last_offset
     url = f"{BASE_URL}getUpdates"
-    params = {"timeout": 100, "offset": last_offset, "allowed_updates": ["message", "callback_query"]}
+    # fix: 宿主网络会概率断开 ~30s+ 的空闲长连接，缩短轮询窗口规避
+    params = {"timeout": 20, "offset": last_offset, "allowed_updates": ["message", "callback_query"]}
     try:
-        response = requests.get(url, params=params, timeout=110)
+        response = requests.get(url, params=params, timeout=25)
         if response.status_code != 200:
             # fix #4: 区分鉴权、冲突和限流错误，交由唯一入口选择退避策略
             if response.status_code == 401:
