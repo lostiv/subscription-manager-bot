@@ -1,5 +1,4 @@
 import requests
-import time
 import json
 import html
 import re
@@ -31,7 +30,11 @@ last_offset = 0
 user_state = {
     "pending_action": None,
     "pending_edit_target": None,
-    "pending_import": False
+    "pending_import": False,
+    "panel_message_id": None,
+    "panel_state": None,
+    "renew_name": None,
+    "renew_months": None,
 }
 
 # ====================== 多语言字典 ======================
@@ -102,6 +105,7 @@ TRANSLATIONS = {
     "cancel_button": {"en": "❌ Cancel", "zh": "❌ 取消"},
     "cancelled": {"en": "✅ Cancelled", "zh": "✅ 已取消"},
     "close_button": {"en": "❌ Close", "zh": "❌ 关闭"},
+    "closed_panel": {"en": "📴 Panel closed.\nSend /start or /subs to reopen.", "zh": "📴 面板已关闭。\n需要继续时，发送 /start 或 /subs 重新打开。"},
 }
 
 def send_msg(text, reply_markup=None):
@@ -115,17 +119,35 @@ def send_msg(text, reply_markup=None):
         if response.status_code != 200:
             # fix #2: 日志只记录状态码，避免泄露请求上下文或凭据
             print(f"❌ Send failed: HTTP {response.status_code}")
-            return False
+            return None
         if response.json().get("ok") is False:
             print("❌ Send failed: Telegram API error")
-            return False
+            return None
         else:
-            # fix #7: 调用方通过返回值判断发送是否成功
             print("✅ Message sent successfully")
-            return True
+            result = response.json().get("result")
+            if isinstance(result, list) and result:
+                message_id = result[0].get("message_id")
+            elif isinstance(result, dict):
+                message_id = result.get("message_id")
+            else:
+                message_id = None
+            return int(message_id) if message_id is not None else None
     except Exception as e:
         print(f"❌ Send error: {type(e).__name__}")
-        return False
+        return None
+
+
+def delete_message(chat_id, message_id):
+    """尽力删除面板消息，失败时静默返回。"""
+    try:
+        requests.post(
+            f"{BASE_URL}deleteMessage",
+            data={"chat_id": chat_id, "message_id": message_id},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 
 def edit_msg(chat_id, message_id, text, reply_markup=None, remove_keyboard=False):
@@ -145,6 +167,26 @@ def edit_msg(chat_id, message_id, text, reply_markup=None, remove_keyboard=False
         return response.status_code == 200 and response.json().get("ok", True) is not False
     except Exception:
         return False
+
+
+def panel_send_or_edit(text, keyboard=None, new_state=None, remove_keyboard=False):
+    """在单一面板消息上编辑，编辑失败时删除旧消息并重新发送。"""
+    try:
+        mid = user_state.get("panel_message_id")
+        if mid is not None:
+            if edit_msg(TG_USER_ID, mid, text, keyboard, remove_keyboard):
+                user_state["panel_state"] = new_state
+                return True, mid
+            delete_message(TG_USER_ID, mid)
+            user_state["panel_message_id"] = None
+        new_mid = send_msg(text, keyboard)
+        if new_mid is None:
+            return False, None
+        user_state["panel_message_id"] = new_mid
+        user_state["panel_state"] = new_state
+        return True, new_mid
+    except Exception:
+        return False, None
 
 
 def send_export(json_str, lang):
@@ -317,9 +359,8 @@ def send_daily_report():
 def _renew_period_keyboard(name, lang):
     buttons = []
     option_keys = ((1, "renew_opt_1m"), (3, "renew_opt_3m"), (12, "renew_opt_12m"))
-    encoded_name = quote(name, safe="")
     for months, text_key in option_keys:
-        callback_data = f"renew_opt:{encoded_name}:{months}"
+        callback_data = f"renew_opt:{months}"
         if len(callback_data.encode()) <= 58:
             buttons.append({"text": get_text(text_key, lang), "callback_data": callback_data})
     if not buttons:
@@ -331,7 +372,6 @@ def _renew_period_keyboard(name, lang):
 
 # feat: 为续费生成计算方式选择按钮并过滤超长回调数据
 def _renew_mode_keyboard(name, months, lang):
-    encoded_name = quote(name, safe="")
     target = load_targets().get(name)
     if target is None:
         return None
@@ -343,14 +383,14 @@ def _renew_mode_keyboard(name, months, lang):
         ("renew_mode_original", original_date, "orig"),
     )
     for text_key, date_str, mode in callbacks:
-        callback_data = f"renew_mode:{encoded_name}:{months}:{mode}"
+        callback_data = f"renew_mode:{months}:{mode}"
         if len(callback_data.encode()) <= 58:
             mode_buttons.append({
                 "text": get_text(text_key, lang, date=date_str),
                 "callback_data": callback_data,
             })
     footer = []
-    back_data = f"renew_back:{encoded_name}:{months}"
+    back_data = "renew_back"
     if len(back_data.encode()) <= 58:
         footer.append({"text": get_text("back_button", lang), "callback_data": back_data})
     cancel_data = "renew_cancel"
@@ -364,20 +404,35 @@ def _renew_mode_keyboard(name, months, lang):
     return {"inline_keyboard": keyboard} if keyboard else None
 
 
-# feat: 发送续费周期选择消息
+# feat: 在面板中显示续费周期选择
 def _send_renew_period_prompt(name, lang):
+    user_state["renew_name"] = name
+    user_state["renew_months"] = None
     keyboard = _renew_period_keyboard(name, lang)
     prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
     if keyboard is None:
         prompt += "\n\n" + get_text("renew_usage", lang)
-    return send_msg(prompt, keyboard)
+    return panel_send_or_edit(prompt, keyboard, new_state="renew_period")
 
 
-# feat: 发送续费计算方式选择消息
+# feat: 在面板中显示续费计算方式选择
 def _send_renew_mode_prompt(name, months, lang):
+    user_state["renew_months"] = months
     keyboard = _renew_mode_keyboard(name, months, lang)
     prompt = get_text("renew_mode_prompt", lang, name=html.escape(name), months=months)
-    return send_msg(prompt, keyboard)
+    return panel_send_or_edit(prompt, keyboard, new_state="renew_mode")
+
+
+def _edit_confirm_keyboard(lang):
+    return {
+        "inline_keyboard": [
+            [{"text": get_text("renew_button", lang), "callback_data": "edit_confirm_renew"}],
+            [
+                {"text": get_text("back_button", lang), "callback_data": "edit_back"},
+                {"text": get_text("cancel_button", lang), "callback_data": "edit_cancel"},
+            ],
+        ]
+    }
 
 
 def setup_bot_commands():
@@ -474,109 +529,94 @@ def handle_callback_query(update):
     callback_data = update["callback_query"]["data"]
     requests.post(f"{BASE_URL}answerCallbackQuery", data={"callback_query_id": update["callback_query"]["id"]})
     callback_message = update["callback_query"].get("message")
-    chat_id = callback_message.get("chat", {}).get("id") if callback_message else None
     message_id = callback_message.get("message_id") if callback_message else None
-
-    def edit_current(text, keyboard=None, remove_keyboard=False):
-        if chat_id is not None and message_id is not None:
-            return edit_msg(
-                chat_id,
-                message_id,
-                text,
-                reply_markup=keyboard,
-                remove_keyboard=remove_keyboard,
-            )
-        return False
+    if message_id is not None:
+        # feat: 用户点击的消息成为后续交互的面板锚点
+        user_state["panel_message_id"] = message_id
     
     if callback_data == "action_edit":
         user_state["pending_action"] = "edit"
-        send_msg(get_text("edit_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("edit_prompt", lang), generate_inline_buttons(lang), new_state="input_edit")
     elif callback_data == "action_archive":
         user_state["pending_action"] = "archive"
-        send_msg(get_text("archive_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("archive_prompt", lang), generate_inline_buttons(lang), new_state="input_archive")
     elif callback_data == "action_renew":
         user_state["pending_action"] = "renew"
-        send_msg(get_text("renew_select_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("renew_select_prompt", lang), generate_inline_buttons(lang), new_state="input_renew")
     elif callback_data == "show_subscriptions":
         show_targets(update)
     elif callback_data == "add_target":
-        send_msg(get_text("add_target_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("add_target_prompt", lang), generate_inline_buttons(lang), new_state="input_add")
     elif callback_data == "set_time":
-        send_msg(get_text("set_time_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("set_time_prompt", lang), generate_inline_buttons(lang), new_state="input_time")
     elif callback_data == "export_data":
         data = export_all()
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         send_export(json_str, lang)
     elif callback_data == "import_data":
         user_state["pending_import"] = True
-        send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("import_prompt", lang), generate_inline_buttons(lang), new_state="input_import")
     # feat: 处理提醒消息进入续费周期选择
     elif callback_data.startswith("renew:"):
         name = unquote(callback_data[len("renew:"):])
         if name not in load_targets():
-            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
         else:
-            prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
-            keyboard = _renew_period_keyboard(name, lang)
-            if not edit_current(prompt, keyboard):
-                _send_renew_period_prompt(name, lang)
+            _send_renew_period_prompt(name, lang)
     # feat: 处理续费周期回调并进入计算方式选择
     elif callback_data.startswith("renew_opt:"):
-        encoded_name, separator, months_str = callback_data[len("renew_opt:"):].rpartition(":")
-        name = unquote(encoded_name) if separator else ""
+        months_str = callback_data[len("renew_opt:"):]
+        name = user_state.get("renew_name")
+        try:
+            months = int(months_str)
+        except ValueError:
+            months = None
+        if months in {1, 3, 12} and name:
+            _send_renew_mode_prompt(name, months, lang)
+        else:
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
+    elif callback_data.startswith("renew_mode:"):
+        months_str, separator, mode = callback_data[len("renew_mode:"):].partition(":")
+        name = user_state.get("renew_name")
         try:
             months = int(months_str) if separator else None
         except ValueError:
             months = None
-        if months in {1, 3, 12} and name:
-            prompt = get_text("renew_mode_prompt", lang, name=html.escape(name), months=months)
-            if not edit_current(prompt, _renew_mode_keyboard(name, months, lang)):
-                _send_renew_mode_prompt(name, months, lang)
-        else:
-            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
-    elif callback_data.startswith("renew_mode:"):
-        encoded_name, separator, mode_data = callback_data[len("renew_mode:"):].partition(":")
-        months_str, separator2, mode = mode_data.rpartition(":") if separator else ("", "", "")
-        name = unquote(encoded_name) if separator else ""
-        try:
-            months = int(months_str) if separator2 else None
-        except ValueError:
-            months = None
         base = {"today": "today", "orig": "original"}.get(mode)
-        new_date = renew_target(name, months, base) if base else None
+        new_date = renew_target(name, months, base) if name and months in {1, 3, 12} and base else None
         if new_date:
             success_text = get_text("renew_success", lang, name=html.escape(name), date=new_date)
-            if not edit_current(success_text, generate_inline_buttons(lang)):
-                send_msg(success_text, generate_inline_buttons(lang))
+            panel_send_or_edit(success_text, generate_inline_buttons(lang), new_state="main")
             show_targets(update)
         else:
-            failed_text = get_text("renew_failed", lang)
-            if not edit_current(failed_text, generate_inline_buttons(lang)):
-                send_msg(failed_text, generate_inline_buttons(lang))
-    elif callback_data.startswith("renew_back:"):
-        encoded_name, separator, months_str = callback_data[len("renew_back:"):].rpartition(":")
-        name = unquote(encoded_name) if separator else ""
-        prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
-        keyboard = _renew_period_keyboard(name, lang)
-        if not edit_current(prompt, keyboard):
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
+    elif callback_data == "renew_back":
+        name = user_state.get("renew_name")
+        if name:
             _send_renew_period_prompt(name, lang)
+        else:
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
+    elif callback_data == "edit_confirm_renew":
+        name = user_state.get("pending_edit_target")
+        if name and name in load_targets():
+            user_state["pending_edit_target"] = None
+            _send_renew_period_prompt(name, lang)
+        else:
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
+    elif callback_data == "edit_back":
+        user_state["pending_edit_target"] = None
+        show_targets(update)
+    elif callback_data == "edit_cancel":
+        user_state["pending_edit_target"] = None
+        panel_send_or_edit(get_text("cancelled", lang), generate_inline_buttons(lang), new_state="main")
     elif callback_data == "renew_exit" or callback_data == "menu_exit":
-        _show_targets_inplace(chat_id, message_id, lang)
+        show_targets(update)
     elif callback_data == "renew_cancel" or callback_data == "menu_cancel":
-        if not edit_current(get_text("cancelled", lang), remove_keyboard=True):
-            send_msg(get_text("cancelled", lang))
+        panel_send_or_edit(get_text("cancelled", lang), generate_inline_buttons(lang), new_state="main")
     elif callback_data == "close_menu":
-        try:
-            edit_current("✨", remove_keyboard=True)
-            time.sleep(0.4)
-            if chat_id is not None and message_id is not None:
-                requests.post(
-                    f"{BASE_URL}deleteMessage",
-                    data={"chat_id": chat_id, "message_id": message_id},
-                    timeout=10,
-                )
-        except Exception:
-            pass
+        panel_send_or_edit(get_text("closed_panel", lang), remove_keyboard=True, new_state=None)
+        user_state["panel_message_id"] = None
+        user_state["panel_state"] = None
 
 def handle_message(update):
     global user_state
@@ -591,16 +631,16 @@ def handle_message(update):
     command, args = _parse_command(text)
 
     if command == "/start":
-        send_msg(get_text("start_welcome", lang), generate_inline_buttons(lang))
+        show_targets(update)
         return
 
     # feat: 支持通过 /renew 和完整名称发起续费顺延
     if command == "/renew":
         name = args.strip()
         if not name:
-            send_msg(get_text("renew_usage", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("renew_usage", lang), generate_inline_buttons(lang), new_state="main")
         elif name not in load_targets():
-            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
         else:
             _send_renew_period_prompt(name, lang)
         return
@@ -608,9 +648,9 @@ def handle_message(update):
     if command == "/language":
         requested_lang = args.strip().lower()
         if requested_lang not in {"zh", "en"} or not set_language(requested_lang):
-            send_msg(get_text("language_usage", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("language_usage", lang), generate_inline_buttons(lang), new_state="main")
         else:
-            send_msg(get_text("language_set", requested_lang), generate_inline_buttons(requested_lang))
+            panel_send_or_edit(get_text("language_set", requested_lang), generate_inline_buttons(requested_lang), new_state="main")
         return
 
     if user_state["pending_action"] and text.isdigit():
@@ -621,13 +661,13 @@ def handle_message(update):
         if idx == 0 and user_state["pending_action"] == "archive":
             archives = load_archives()
             if not archives:
-                send_msg(get_text("no_archived", lang), generate_inline_buttons(lang))
+                panel_send_or_edit(get_text("no_archived", lang), generate_inline_buttons(lang), new_state="main")
             else:
                 msg = get_text("archived_history", lang)
                 for name, target_date in sorted(archives.items(), key=lambda x: x[1], reverse=True):
                     # fix: 归档名称是用户输入，插入 HTML 前必须转义
                     msg += f"• {html.escape(name)}: {target_date.strftime('%Y-%m-%d')}\n"
-                send_msg(msg, generate_inline_buttons(lang))
+                panel_send_or_edit(msg, generate_inline_buttons(lang), new_state="main")
             user_state["pending_action"] = None
             return
 
@@ -638,29 +678,18 @@ def handle_message(update):
             if user_state["pending_action"] == "edit":
                 user_state["pending_edit_target"] = old_name
                 user_state["pending_action"] = None
-                callback_data = f"renew:{quote(old_name, safe='')}"
-                keyboard = None
-                if len(callback_data.encode()) <= 58:
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": get_text("renew_button", lang), "callback_data": callback_data}],
-                            [
-                                {"text": get_text("back_button", lang), "callback_data": "menu_exit"},
-                                {"text": get_text("cancel_button", lang), "callback_data": "menu_cancel"},
-                            ],
-                        ]
-                    }
-                send_msg(
+                panel_send_or_edit(
                     get_text("edit_current", lang, name=html.escape(old_name), date=current_date),
-                    keyboard,
+                    _edit_confirm_keyboard(lang),
+                    new_state="edit_confirm",
                 )
                 return
             elif user_state["pending_action"] == "archive":
                 if archive_target(old_name):
-                    send_msg(get_text("archive_success", lang, name=html.escape(old_name)), generate_inline_buttons(lang))
+                    panel_send_or_edit(get_text("archive_success", lang, name=html.escape(old_name)), generate_inline_buttons(lang), new_state="main")
                     show_targets(update)
                 else:
-                    send_msg(get_text("archive_failed", lang), generate_inline_buttons(lang))
+                    panel_send_or_edit(get_text("archive_failed", lang), generate_inline_buttons(lang), new_state="main")
                 user_state["pending_action"] = None
                 return
             elif user_state["pending_action"] == "renew":
@@ -682,13 +711,13 @@ def handle_message(update):
             new_name = text.strip()
         else:
             # fix #16: 编辑解析失败时保留状态，不静默修改目标
-            send_msg(get_text("edit_format_error", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("edit_format_error", lang), generate_inline_buttons(lang), new_state="input_edit")
             return
         updated = update_target(old_name, new_name, new_date)
         if updated:
-            send_msg(get_text("edit_success", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("edit_success", lang), generate_inline_buttons(lang), new_state="main")
         else:
-            send_msg(get_text("edit_failed", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("edit_failed", lang), generate_inline_buttons(lang), new_state="main")
         user_state["pending_edit_target"] = None
         if updated:
             # fix #20: 编辑操作完成后由编辑流程主动清理状态
@@ -703,7 +732,7 @@ def handle_message(update):
             if not _json_depth_ok(import_data) or not validate_import_data(import_data):
                 raise ValueError("invalid import structure")
             result = import_all(import_data)
-            send_msg(
+            panel_send_or_edit(
                 get_text(
                     "import_summary",
                     lang,
@@ -713,11 +742,12 @@ def handle_message(update):
                     skipped=result["skipped"],
                 ),
                 generate_inline_buttons(lang),
+                new_state="main",
             )
             show_targets(update)
         except Exception as e:
             # fix #13: 限制导入大小和结构，失败时只返回固定描述
-            send_msg(get_text("import_invalid", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("import_invalid", lang), generate_inline_buttons(lang), new_state="input_import")
         user_state["pending_import"] = False
         return
 
@@ -727,12 +757,12 @@ def handle_message(update):
             name, date_str = parsed
             from .db import add_target
             if add_target(name, date_str):
-                send_msg(get_text("add_success", lang), generate_inline_buttons(lang))
+                panel_send_or_edit(get_text("add_success", lang), generate_inline_buttons(lang), new_state="main")
                 show_targets(update)
             else:
-                send_msg(get_text("add_failed", lang), generate_inline_buttons(lang))
+                panel_send_or_edit(get_text("add_failed", lang), generate_inline_buttons(lang), new_state="main")
         else:
-            send_msg(get_text("format_error", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("format_error", lang), generate_inline_buttons(lang), new_state="input_add")
         return
 
     elif command == "/export":
@@ -742,14 +772,14 @@ def handle_message(update):
 
     elif command == "/import":
         user_state["pending_import"] = True
-        send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
+        panel_send_or_edit(get_text("import_prompt", lang), generate_inline_buttons(lang), new_state="input_import")
 
     elif is_valid_push_time(text):
         from .db import set_push_time
         if set_push_time(text):
-            send_msg(get_text("push_time_set", lang, time=get_push_time()), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("push_time_set", lang, time=get_push_time()), generate_inline_buttons(lang), new_state="main")
         else:
-            send_msg(get_text("push_time_failed", lang), generate_inline_buttons(lang))
+            panel_send_or_edit(get_text("push_time_failed", lang), generate_inline_buttons(lang), new_state="input_time")
         return
 
     elif command == "/subs" or (command == "/list" and args.strip().lower() == "all"):
@@ -766,14 +796,7 @@ def show_targets(update):
     lang = get_user_lang(update)
     # fix #20: 展示列表不清理尚未完成的交互状态
     formatted, keyboard = _targets_message(lang)
-    send_msg(formatted, keyboard)
-
-
-def _show_targets_inplace(chat_id, message_id, lang):
-    formatted, keyboard = _targets_message(lang)
-    if chat_id is not None and message_id is not None and edit_msg(chat_id, message_id, formatted, keyboard):
-        return True
-    return send_msg(formatted, keyboard)
+    return panel_send_or_edit(formatted, keyboard, new_state="main")
 
 
 def _json_depth_ok(value, depth=0):
