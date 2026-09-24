@@ -3,7 +3,7 @@ import threading
 
 from app.db import init_db
 from app.scheduler import push_loop
-from app.telegram import poll_updates, setup_bot_commands
+from app.telegram import poll_updates, setup_bot_commands, start_cleanup_worker
 from app.config import DB_PATH, TIMEZONE
 
 stop_event = threading.Event()
@@ -15,6 +15,7 @@ def initialize():
     from app.db import get_push_time
     print(f"配置摘要: 时区={TIMEZONE.key}, 推送时间={get_push_time()}, DB路径={DB_PATH}")
     setup_bot_commands()
+    start_cleanup_worker()
 
 def start_scheduler():
     thread = threading.Thread(target=push_loop, args=(stop_event,))

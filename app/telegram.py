@@ -2,6 +2,8 @@ import requests
 import json
 import html
 import re
+import threading
+import time
 # feat: 使用标准库编码续费回调中的目标名称
 from urllib.parse import quote, unquote
 from datetime import datetime
@@ -26,6 +28,10 @@ from .config import BOT_TOKEN, TG_USER_ID, BASE_URL, TIMEZONE
 from .utils import reminder_node_for
 
 last_offset = 0
+USER_MSG_TTL_SECONDS = 30
+_pending_deletions = []
+_pending_deletions_lock = threading.Lock()
+_cleanup_started = False
 
 user_state = {
     "pending_action": None,
@@ -36,6 +42,53 @@ user_state = {
     "renew_name": None,
     "renew_months": None,
 }
+
+
+def _queue_user_message(update, now=None):
+    """将已鉴权的文本用户消息加入定时清理队列。"""
+    message = update.get("message", {})
+    if not message.get("text") or message.get("message_id") is None:
+        return
+    if now is None:
+        now = time.time()
+    chat_id = message.get("chat", {}).get("id")
+    with _pending_deletions_lock:
+        _pending_deletions.append((now + USER_MSG_TTL_SECONDS, chat_id, message["message_id"]))
+
+
+def _cleanup_sweep(now=None):
+    """删除到期的用户消息，并移除所有已处理条目。"""
+    if now is None:
+        now = time.time()
+    with _pending_deletions_lock:
+        due = [item for item in _pending_deletions if now >= item[0]]
+        _pending_deletions[:] = [item for item in _pending_deletions if now < item[0]]
+    for _, chat_id, message_id in due:
+        try:
+            delete_message(chat_id, message_id)
+        except Exception:
+            pass
+    return len(due)
+
+
+def _cleanup_worker():
+    while True:
+        try:
+            _cleanup_sweep()
+            time.sleep(5)
+        except Exception as error:
+            print(f"⚠️ Cleanup warning: {type(error).__name__}")
+            time.sleep(5)
+
+
+def start_cleanup_worker():
+    global _cleanup_started
+    if _cleanup_started:
+        return
+    _cleanup_started = True
+    thread = threading.Thread(target=_cleanup_worker)
+    thread.daemon = True
+    thread.start()
 
 # ====================== 多语言字典 ======================
 TRANSLATIONS = {
@@ -850,6 +903,8 @@ def poll_updates():
         failed_update = False
         for update in data.get("result", []):
             try:
+                if is_authorized_update(update):
+                    _queue_user_message(update)
                 if "callback_query" in update:
                     handle_callback_query(update)
                 elif "message" in update:
