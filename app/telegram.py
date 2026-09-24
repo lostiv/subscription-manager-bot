@@ -128,6 +128,25 @@ def send_msg(text, reply_markup=None):
         return False
 
 
+def edit_msg(chat_id, message_id, text, reply_markup=None, remove_keyboard=False):
+    """原地编辑消息，失败时由调用方回退发送新消息。"""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    elif remove_keyboard:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": []})
+    try:
+        response = requests.post(f"{BASE_URL}editMessageText", data=payload, timeout=10)
+        return response.status_code == 200 and response.json().get("ok", True) is not False
+    except Exception:
+        return False
+
+
 def send_export(json_str, lang):
     """以文档发送备份，避免 Telegram 文本消息长度限制。"""
     if len(json_str.encode("utf-8")) > 10 * 1024 * 1024:
@@ -454,6 +473,20 @@ def handle_callback_query(update):
     lang = get_user_lang(update)
     callback_data = update["callback_query"]["data"]
     requests.post(f"{BASE_URL}answerCallbackQuery", data={"callback_query_id": update["callback_query"]["id"]})
+    callback_message = update["callback_query"].get("message")
+    chat_id = callback_message.get("chat", {}).get("id") if callback_message else None
+    message_id = callback_message.get("message_id") if callback_message else None
+
+    def edit_current(text, keyboard=None, remove_keyboard=False):
+        if chat_id is not None and message_id is not None:
+            return edit_msg(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=keyboard,
+                remove_keyboard=remove_keyboard,
+            )
+        return False
     
     if callback_data == "action_edit":
         user_state["pending_action"] = "edit"
@@ -477,26 +510,16 @@ def handle_callback_query(update):
     elif callback_data == "import_data":
         user_state["pending_import"] = True
         send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
-    elif callback_data == "close_menu":
-        message = update.get("callback_query", {}).get("message", {})
-        try:
-            requests.post(
-                f"{BASE_URL}deleteMessage",
-                data={
-                    "chat_id": message.get("chat", {}).get("id"),
-                    "message_id": message.get("message_id"),
-                },
-                timeout=10,
-            )
-        except Exception:
-            pass
     # feat: 处理提醒消息进入续费周期选择
     elif callback_data.startswith("renew:"):
         name = unquote(callback_data[len("renew:"):])
         if name not in load_targets():
             send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
         else:
-            _send_renew_period_prompt(name, lang)
+            prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
+            keyboard = _renew_period_keyboard(name, lang)
+            if not edit_current(prompt, keyboard):
+                _send_renew_period_prompt(name, lang)
     # feat: 处理续费周期回调并进入计算方式选择
     elif callback_data.startswith("renew_opt:"):
         encoded_name, separator, months_str = callback_data[len("renew_opt:"):].rpartition(":")
@@ -506,10 +529,11 @@ def handle_callback_query(update):
         except ValueError:
             months = None
         if months in {1, 3, 12} and name:
-            _send_renew_mode_prompt(name, months, lang)
+            prompt = get_text("renew_mode_prompt", lang, name=html.escape(name), months=months)
+            if not edit_current(prompt, _renew_mode_keyboard(name, months, lang)):
+                _send_renew_mode_prompt(name, months, lang)
         else:
             send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
-    # feat: 处理续费计算方式回调并刷新目标列表
     elif callback_data.startswith("renew_mode:"):
         encoded_name, separator, mode_data = callback_data[len("renew_mode:"):].partition(":")
         months_str, separator2, mode = mode_data.rpartition(":") if separator else ("", "", "")
@@ -521,22 +545,38 @@ def handle_callback_query(update):
         base = {"today": "today", "orig": "original"}.get(mode)
         new_date = renew_target(name, months, base) if base else None
         if new_date:
-            send_msg(get_text("renew_success", lang, name=html.escape(name), date=new_date), generate_inline_buttons(lang))
+            success_text = get_text("renew_success", lang, name=html.escape(name), date=new_date)
+            if not edit_current(success_text, generate_inline_buttons(lang)):
+                send_msg(success_text, generate_inline_buttons(lang))
             show_targets(update)
         else:
-            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+            failed_text = get_text("renew_failed", lang)
+            if not edit_current(failed_text, generate_inline_buttons(lang)):
+                send_msg(failed_text, generate_inline_buttons(lang))
     elif callback_data.startswith("renew_back:"):
         encoded_name, separator, months_str = callback_data[len("renew_back:"):].rpartition(":")
         name = unquote(encoded_name) if separator else ""
-        _send_renew_period_prompt(name, lang)
-    elif callback_data == "renew_exit":
-        show_targets(update)
-    elif callback_data == "renew_cancel":
-        send_msg(get_text("cancelled", lang))
-    elif callback_data == "menu_exit":
-        show_targets(update)
-    elif callback_data == "menu_cancel":
-        send_msg(get_text("cancelled", lang))
+        prompt = get_text("renew_period_prompt", lang, name=html.escape(name))
+        keyboard = _renew_period_keyboard(name, lang)
+        if not edit_current(prompt, keyboard):
+            _send_renew_period_prompt(name, lang)
+    elif callback_data == "renew_exit" or callback_data == "menu_exit":
+        _show_targets_inplace(chat_id, message_id, lang)
+    elif callback_data == "renew_cancel" or callback_data == "menu_cancel":
+        if not edit_current(get_text("cancelled", lang), remove_keyboard=True):
+            send_msg(get_text("cancelled", lang))
+    elif callback_data == "close_menu":
+        try:
+            edit_current("✨", remove_keyboard=True)
+            time.sleep(0.4)
+            if chat_id is not None and message_id is not None:
+                requests.post(
+                    f"{BASE_URL}deleteMessage",
+                    data={"chat_id": chat_id, "message_id": message_id},
+                    timeout=10,
+                )
+        except Exception:
+            pass
 
 def handle_message(update):
     global user_state
@@ -715,13 +755,25 @@ def handle_message(update):
     elif command == "/subs" or (command == "/list" and args.strip().lower() == "all"):
         show_targets(update)
 
-def show_targets(update):
-    lang = get_user_lang(update)
-    # fix #20: 展示列表不清理尚未完成的交互状态
+def _targets_message(lang):
     targets = load_targets()
     formatted = format_numbered_targets(targets, lang)
     keyboard = generate_inline_buttons(lang)
+    return formatted, keyboard
+
+
+def show_targets(update):
+    lang = get_user_lang(update)
+    # fix #20: 展示列表不清理尚未完成的交互状态
+    formatted, keyboard = _targets_message(lang)
     send_msg(formatted, keyboard)
+
+
+def _show_targets_inplace(chat_id, message_id, lang):
+    formatted, keyboard = _targets_message(lang)
+    if chat_id is not None and message_id is not None and edit_msg(chat_id, message_id, formatted, keyboard):
+        return True
+    return send_msg(formatted, keyboard)
 
 
 def _json_depth_ok(value, depth=0):
