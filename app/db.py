@@ -390,10 +390,12 @@ def add_months(date_str: str, months: int):
 
 
 # feat: 在单事务内完成续费顺延并清除旧提醒记录
-def renew_target(name: str, months: int):
-    """从原日期和今天中较晚者顺延，成功返回新日期字符串。"""
+def renew_target(name: str, months: int, base: str = "later"):
+    """续费目标。base: 'today'=从今天起算; 'original'=从原到期日顺延; 'later'=取两者较晚。"""
     # feat: 严格限制续费周期为整数月数选项
     if isinstance(months, bool) or not isinstance(months, int) or months not in {1, 3, 12}:
+        return None
+    if base not in {"today", "original", "later"}:
         return None
     conn = _connect()
     try:
@@ -409,7 +411,13 @@ def renew_target(name: str, months: int):
         except (TypeError, ValueError):
             conn.rollback()
             return None
-        base_date = max(original_date, datetime.now(TIMEZONE).date())
+        today = datetime.now(TIMEZONE).date()
+        if base == "today":
+            base_date = today
+        elif base == "original":
+            base_date = original_date
+        else:
+            base_date = max(original_date, today)
         new_date = add_months(base_date.strftime("%Y-%m-%d"), months)
         if not new_date:
             conn.rollback()
