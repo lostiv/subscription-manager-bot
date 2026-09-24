@@ -92,9 +92,16 @@ TRANSLATIONS = {
     "renew_opt_1m": {"en": "+1 month", "zh": "+1 个月"},
     "renew_opt_3m": {"en": "+1 quarter", "zh": "+1 季度"},
     "renew_opt_12m": {"en": "+1 year", "zh": "+1 年"},
-    "renew_success": {"en": "✅ {name} extended to {date}", "zh": "✅ {name} 已顺延至 {date}"},
+    "renew_success": {"en": "✅ {name} new expiry: {date}", "zh": "✅ {name} 新到期日：{date}"},
     "renew_failed": {"en": "❌ Renewal failed (target does not exist or has been archived)", "zh": "❌ 续费失败（目标不存在或已被归档）"},
     "renew_usage": {"en": "Usage: /renew <name> (or use the reminder button)", "zh": "用法 /renew <名称>（或从提醒按钮进入）"},
+    "renew_mode_prompt": {"en": "⏳ {name} renew {months} month(s), choose start date:", "zh": "⏳ {name} 续费 {months} 个月，选择起始日期："},
+    "renew_mode_today": {"en": "📅 From today ({date})", "zh": "📅 从今天起算（{date}）"},
+    "renew_mode_original": {"en": "📅 Extend from expiry ({date})", "zh": "📅 从原到期顺延（{date}）"},
+    "back_button": {"en": "⬅️ Back", "zh": "⬅️ 返回"},
+    "cancel_button": {"en": "❌ Cancel", "zh": "❌ 取消"},
+    "cancelled": {"en": "✅ Cancelled", "zh": "✅ 已取消"},
+    "close_button": {"en": "❌ Close", "zh": "❌ 关闭"},
 }
 
 def send_msg(text, reply_markup=None):
@@ -218,6 +225,9 @@ def generate_inline_buttons(lang="en"):
             ],
             [
                 {"text": get_text("set_time_button", lang), "callback_data": "set_time"},
+            ],
+            [
+                {"text": get_text("close_button", lang), "callback_data": "close_menu"},
             ]
         ]
     }
@@ -293,7 +303,46 @@ def _renew_period_keyboard(name, lang):
         callback_data = f"renew_opt:{encoded_name}:{months}"
         if len(callback_data.encode()) <= 58:
             buttons.append({"text": get_text(text_key, lang), "callback_data": callback_data})
-    return {"inline_keyboard": [buttons]} if buttons else None
+    if not buttons:
+        return None
+    buttons.append({"text": get_text("back_button", lang), "callback_data": "renew_exit"})
+    buttons.append({"text": get_text("cancel_button", lang), "callback_data": "renew_cancel"})
+    return {"inline_keyboard": [buttons[:-2], buttons[-2:]]}
+
+
+# feat: 为续费生成计算方式选择按钮并过滤超长回调数据
+def _renew_mode_keyboard(name, months, lang):
+    encoded_name = quote(name, safe="")
+    target = load_targets().get(name)
+    if target is None:
+        return None
+    original_date = target.strftime("%Y-%m-%d")
+    today_date = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    mode_buttons = []
+    callbacks = (
+        ("renew_mode_today", today_date, "today"),
+        ("renew_mode_original", original_date, "orig"),
+    )
+    for text_key, date_str, mode in callbacks:
+        callback_data = f"renew_mode:{encoded_name}:{months}:{mode}"
+        if len(callback_data.encode()) <= 58:
+            mode_buttons.append({
+                "text": get_text(text_key, lang, date=date_str),
+                "callback_data": callback_data,
+            })
+    footer = []
+    back_data = f"renew_back:{encoded_name}:{months}"
+    if len(back_data.encode()) <= 58:
+        footer.append({"text": get_text("back_button", lang), "callback_data": back_data})
+    cancel_data = "renew_cancel"
+    if len(cancel_data.encode()) <= 58:
+        footer.append({"text": get_text("cancel_button", lang), "callback_data": cancel_data})
+    keyboard = []
+    if mode_buttons:
+        keyboard.append(mode_buttons)
+    if footer:
+        keyboard.append(footer)
+    return {"inline_keyboard": keyboard} if keyboard else None
 
 
 # feat: 发送续费周期选择消息
@@ -303,6 +352,30 @@ def _send_renew_period_prompt(name, lang):
     if keyboard is None:
         prompt += "\n\n" + get_text("renew_usage", lang)
     return send_msg(prompt, keyboard)
+
+
+# feat: 发送续费计算方式选择消息
+def _send_renew_mode_prompt(name, months, lang):
+    keyboard = _renew_mode_keyboard(name, months, lang)
+    prompt = get_text("renew_mode_prompt", lang, name=html.escape(name), months=months)
+    return send_msg(prompt, keyboard)
+
+
+def setup_bot_commands():
+    """设置 Telegram 命令菜单，失败时仅记录警告。"""
+    try:
+        response = requests.post(
+            f"{BASE_URL}setMyCommands",
+            data={"commands": json.dumps([{
+                "command": "start",
+                "description": "打开主菜单 / Open main menu",
+            }], ensure_ascii=False)},
+            timeout=10,
+        )
+        if response.status_code != 200 or response.json().get("ok") is False:
+            print("⚠️ Failed to set bot commands")
+    except Exception as error:
+        print(f"⚠️ Bot command setup warning: {type(error).__name__}")
 
 
 # feat: 检查并发送每个目标命中的到期提醒节点
@@ -404,6 +477,19 @@ def handle_callback_query(update):
     elif callback_data == "import_data":
         user_state["pending_import"] = True
         send_msg(get_text("import_prompt", lang), generate_inline_buttons(lang))
+    elif callback_data == "close_menu":
+        message = update.get("callback_query", {}).get("message", {})
+        try:
+            requests.post(
+                f"{BASE_URL}deleteMessage",
+                data={
+                    "chat_id": message.get("chat", {}).get("id"),
+                    "message_id": message.get("message_id"),
+                },
+                timeout=10,
+            )
+        except Exception:
+            pass
     # feat: 处理提醒消息进入续费周期选择
     elif callback_data.startswith("renew:"):
         name = unquote(callback_data[len("renew:"):])
@@ -411,7 +497,7 @@ def handle_callback_query(update):
             send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
         else:
             _send_renew_period_prompt(name, lang)
-    # feat: 处理续费周期回调并刷新目标列表
+    # feat: 处理续费周期回调并进入计算方式选择
     elif callback_data.startswith("renew_opt:"):
         encoded_name, separator, months_str = callback_data[len("renew_opt:"):].rpartition(":")
         name = unquote(encoded_name) if separator else ""
@@ -419,12 +505,38 @@ def handle_callback_query(update):
             months = int(months_str) if separator else None
         except ValueError:
             months = None
-        new_date = renew_target(name, months)
+        if months in {1, 3, 12} and name:
+            _send_renew_mode_prompt(name, months, lang)
+        else:
+            send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+    # feat: 处理续费计算方式回调并刷新目标列表
+    elif callback_data.startswith("renew_mode:"):
+        encoded_name, separator, mode_data = callback_data[len("renew_mode:"):].partition(":")
+        months_str, separator2, mode = mode_data.rpartition(":") if separator else ("", "", "")
+        name = unquote(encoded_name) if separator else ""
+        try:
+            months = int(months_str) if separator2 else None
+        except ValueError:
+            months = None
+        base = {"today": "today", "orig": "original"}.get(mode)
+        new_date = renew_target(name, months, base) if base else None
         if new_date:
             send_msg(get_text("renew_success", lang, name=html.escape(name), date=new_date), generate_inline_buttons(lang))
             show_targets(update)
         else:
             send_msg(get_text("renew_failed", lang), generate_inline_buttons(lang))
+    elif callback_data.startswith("renew_back:"):
+        encoded_name, separator, months_str = callback_data[len("renew_back:"):].rpartition(":")
+        name = unquote(encoded_name) if separator else ""
+        _send_renew_period_prompt(name, lang)
+    elif callback_data == "renew_exit":
+        show_targets(update)
+    elif callback_data == "renew_cancel":
+        send_msg(get_text("cancelled", lang))
+    elif callback_data == "menu_exit":
+        show_targets(update)
+    elif callback_data == "menu_cancel":
+        send_msg(get_text("cancelled", lang))
 
 def handle_message(update):
     global user_state
@@ -490,9 +602,13 @@ def handle_message(update):
                 keyboard = None
                 if len(callback_data.encode()) <= 58:
                     keyboard = {
-                        "inline_keyboard": [[
-                            {"text": get_text("renew_button", lang), "callback_data": callback_data}
-                        ]]
+                        "inline_keyboard": [
+                            [{"text": get_text("renew_button", lang), "callback_data": callback_data}],
+                            [
+                                {"text": get_text("back_button", lang), "callback_data": "menu_exit"},
+                                {"text": get_text("cancel_button", lang), "callback_data": "menu_cancel"},
+                            ],
+                        ]
                     }
                 send_msg(
                     get_text("edit_current", lang, name=html.escape(old_name), date=current_date),
