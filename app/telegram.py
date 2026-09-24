@@ -536,13 +536,25 @@ def handle_callback_query(update):
     
     if callback_data == "action_edit":
         user_state["pending_action"] = "edit"
-        panel_send_or_edit(get_text("edit_prompt", lang), generate_inline_buttons(lang), new_state="input_edit")
+        panel_send_or_edit(
+            get_text("edit_prompt", lang) + "\n\n" + format_numbered_targets(load_targets(), lang),
+            generate_inline_buttons(lang),
+            new_state="input_edit",
+        )
     elif callback_data == "action_archive":
         user_state["pending_action"] = "archive"
-        panel_send_or_edit(get_text("archive_prompt", lang), generate_inline_buttons(lang), new_state="input_archive")
+        panel_send_or_edit(
+            get_text("archive_prompt", lang) + "\n\n" + format_numbered_targets(load_targets(), lang),
+            generate_inline_buttons(lang),
+            new_state="input_archive",
+        )
     elif callback_data == "action_renew":
         user_state["pending_action"] = "renew"
-        panel_send_or_edit(get_text("renew_select_prompt", lang), generate_inline_buttons(lang), new_state="input_renew")
+        panel_send_or_edit(
+            get_text("renew_select_prompt", lang) + "\n\n" + format_numbered_targets(load_targets(), lang),
+            generate_inline_buttons(lang),
+            new_state="input_renew",
+        )
     elif callback_data == "show_subscriptions":
         show_targets(update)
     elif callback_data == "add_target":
@@ -614,7 +626,9 @@ def handle_callback_query(update):
     elif callback_data == "renew_cancel" or callback_data == "menu_cancel":
         panel_send_or_edit(get_text("cancelled", lang), generate_inline_buttons(lang), new_state="main")
     elif callback_data == "close_menu":
-        panel_send_or_edit(get_text("closed_panel", lang), remove_keyboard=True, new_state=None)
+        panel_message_id = user_state.get("panel_message_id")
+        if panel_message_id is not None:
+            delete_message(TG_USER_ID, panel_message_id)
         user_state["panel_message_id"] = None
         user_state["panel_state"] = None
 
