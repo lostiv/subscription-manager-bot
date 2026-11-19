@@ -393,7 +393,7 @@ def add_months(date_str: str, months: int):
 def renew_target(name: str, months: int, base: str = "later"):
     """续费目标。base: 'today'=从今天起算; 'original'=从原到期日顺延; 'later'=取两者较晚。"""
     # feat: 严格限制续费周期为整数月数选项
-    if isinstance(months, bool) or not isinstance(months, int) or months not in {1, 3, 12}:
+    if isinstance(months, bool) or not isinstance(months, int) or months not in {1, 3, 6, 12}:
         return None
     if base not in {"today", "original", "later"}:
         return None

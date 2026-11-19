@@ -147,6 +147,7 @@ TRANSLATIONS = {
     "renew_period_prompt": {"en": "⏳ {name} renewal extension, choose a period:", "zh": "⏳ {name} 续费顺延，选择周期："},
     "renew_opt_1m": {"en": "+1 month", "zh": "+1 个月"},
     "renew_opt_3m": {"en": "+1 quarter", "zh": "+1 季度"},
+    "renew_opt_6m": {"en": "+6 months", "zh": "+6 个月"},
     "renew_opt_12m": {"en": "+1 year", "zh": "+1 年"},
     "renew_success": {"en": "✅ {name} new expiry: {date}", "zh": "✅ {name} 新到期日：{date}"},
     "renew_failed": {"en": "❌ Renewal failed (target does not exist or has been archived)", "zh": "❌ 续费失败（目标不存在或已被归档）"},
@@ -411,16 +412,22 @@ def send_daily_report():
 # feat: 为目标生成续费周期选择按钮并过滤超长回调数据
 def _renew_period_keyboard(name, lang):
     buttons = []
-    option_keys = ((1, "renew_opt_1m"), (3, "renew_opt_3m"), (12, "renew_opt_12m"))
+    option_keys = ((1, "renew_opt_1m"), (3, "renew_opt_3m"), (6, "renew_opt_6m"), (12, "renew_opt_12m"))
     for months, text_key in option_keys:
         callback_data = f"renew_opt:{months}"
         if len(callback_data.encode()) <= 58:
             buttons.append({"text": get_text(text_key, lang), "callback_data": callback_data})
     if not buttons:
         return None
-    buttons.append({"text": get_text("back_button", lang), "callback_data": "renew_exit"})
-    buttons.append({"text": get_text("cancel_button", lang), "callback_data": "renew_cancel"})
-    return {"inline_keyboard": [buttons[:-2], buttons[-2:]]}
+    footer = [
+        {"text": get_text("back_button", lang), "callback_data": "renew_exit"},
+        {"text": get_text("cancel_button", lang), "callback_data": "renew_cancel"},
+    ]
+    if len(buttons) == 4:
+        rows = [buttons[:2], buttons[2:]]
+    else:
+        rows = [buttons]
+    return {"inline_keyboard": rows + [footer]}
 
 
 # feat: 为续费生成计算方式选择按钮并过滤超长回调数据
@@ -636,7 +643,7 @@ def handle_callback_query(update):
             months = int(months_str)
         except ValueError:
             months = None
-        if months in {1, 3, 12} and name:
+        if months in {1, 3, 6, 12} and name:
             _send_renew_mode_prompt(name, months, lang)
         else:
             panel_send_or_edit(get_text("renew_failed", lang), generate_inline_buttons(lang), new_state="main")
@@ -648,7 +655,7 @@ def handle_callback_query(update):
         except ValueError:
             months = None
         base = {"today": "today", "orig": "original"}.get(mode)
-        new_date = renew_target(name, months, base) if name and months in {1, 3, 12} and base else None
+        new_date = renew_target(name, months, base) if name and months in {1, 3, 6, 12} and base else None
         if new_date:
             success_text = get_text("renew_success", lang, name=html.escape(name), date=new_date)
             panel_send_or_edit(success_text, generate_inline_buttons(lang), new_state="main")

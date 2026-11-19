@@ -34,6 +34,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: 🏷️ 生成镜像标签
+        id: image_tag
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            tag="pr-${{ github.event.number }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: 🐳 构建并推送 Docker 镜像
         uses: docker/build-push-action@v6
         with:
@@ -42,7 +52,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             lost4/subscription-manager-bot:latest
-            lost4/subscription-manager-bot:${{ github.ref_name }}
+            lost4/subscription-manager-bot:${{ steps.image_tag.outputs.tag }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
